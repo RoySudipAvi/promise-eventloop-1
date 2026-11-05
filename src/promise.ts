@@ -9,7 +9,7 @@ let instanceId = 0;
 // ANY thenable, not just its own class's instances.
 function isThenable(value: unknown): value is { then: Function } {
   return (
-    typeof value === "object" &&
+    (typeof value === "object" || typeof value === "function") &&
     value !== null &&
     typeof (value as any).then === "function"
   );
@@ -21,91 +21,81 @@ export class MyPromise {
   reason: unknown = undefined;
   reactions = [];
   instance: number = 0;
+  private locked = false;
 
   constructor(
     executor: (
       res: (val: unknown) => void,
-      rej: (reason: unknown) => void
-    ) => void
+      rej: (reason: unknown) => void,
+    ) => void,
   ) {
-    console.log(`-------------- CONSTRUCTOR START -------------------`);
     const boundResolve = this.resolve.bind(this);
     const boundReject = this.reject.bind(this);
     instanceId++;
     this.instance = instanceId;
     try {
-      console.log(
-        `instance: ${this.instance}, state: ${this.state}, value: ${this.value}, reason: ${this.reason}`
-      );
       executor(boundResolve, boundReject);
-      console.log(
-        ` state: ${this.state}, value: ${this.value}, reason: ${this.reason}`
-      );
     } catch (err) {
       boundReject(err);
     }
-
-    console.log(`-------------- CONSTRUCTOR END -------------------`);
   }
-
-  resolve(value: unknown) {
-    console.log(`-------------------- RESOLVE START ------------------------`);
-
-    console.log(
-      `instance: ${this.instance}, state: ${this.state}, value: ${this.value}`
-    );
-
-    if (this.state != "Pending") return;
-    console.log("detailed value", value);
-    console.log(`is it thenable: ${isThenable(value)}`);
-    // If resolved with a thenable, adopt its eventual state instead of
-    // settling immediately with a Promise-shaped value. Nothing calls
-    // .then() on `value` here YET (that plumbing lands with the .then()
-    // increment) — this branch exists now so resolve() doesn't need to be
-    // revisited later, but it currently only guards against treating a
-    // thenable as a plain value; full adoption behavior is wired up once
-    // .then() exists to subscribe to it.
-    if (isThenable(value)) {
-      // Placeholder hook: full adoption (subscribing to the inner
-      // thenable's eventual state) is completed in the .then() increment.
-      // For now we intentionally do not settle, to avoid faking behavior
-      // we haven't built yet.
-      value.then(
-        (innerValue: unknown) => this.resolve(innerValue),
-        (innerReason: unknown) => this.reject(innerReason)
-      );
+  private resolveProcedure(value: unknown) {
+    if (value === this) {
+      this.settleRejected(new TypeError("Chaining cycle detected for promise"));
       return;
     }
-
+    if (isThenable(value)) {
+      microtaskQueue.enqueue(() => {
+        // The thenable may call its callbacks more than once; only the
+        // first call counts.
+        let called = false;
+        try {
+          value.then(
+            (innerValue: unknown) => {
+              if (called) return;
+              called = true;
+              this.resolveProcedure(innerValue);
+            },
+            (innerReason: unknown) => {
+              if (called) return;
+              called = true;
+              this.settleRejected(innerReason);
+            },
+          );
+        } catch (err) {
+          // If then() throws before calling either callback, reject.
+          // If it already called one, the throw is ignored.
+          if (!called) {
+            called = true;
+            this.settleRejected(err);
+          }
+        }
+      });
+      return;
+    }
     this.value = value;
     this.state = "Fulfilled";
     this.settleReactions();
-    console.log(`-------------------- RESOLVE END ------------------------`);
+  }
+
+  resolve(value: unknown) {
+    if (this.locked || this.state != "Pending") return;
+    this.locked = true;
+    this.resolveProcedure(value);
   }
 
   reject(reason: unknown) {
-    console.log(`-------------------- REJECT START ------------------------`);
+    if (this.locked || this.state != "Pending") return;
+    this.locked = true;
+    this.settleRejected(reason);
+  }
 
-    console.log(
-      `instance: ${this.instance}, state: ${this.state}, reason: ${this.reason}`
-    );
-
-    if (this.state != "Pending") return;
-
+  private settleRejected(reason: unknown) {
     this.reason = reason;
     this.state = "Rejected";
     this.settleReactions();
-    console.log(`-------------------- REJECT END ------------------------`);
   }
-
   settleReactions(): void {
-    console.log(
-      `-------------------- SETTLEREACTIONS START ------------------------`
-    );
-
-    console.log(
-      `instance: ${this.instance}, state: ${this.state}, value:${this.value}, reason: ${this.reason}`
-    );
     const state = this.state;
     const settledValue = state === "Fulfilled" ? this.value : this.reason;
 
@@ -117,10 +107,6 @@ export class MyPromise {
       }
     }
     this.reactions = [];
-
-    console.log(
-      `-------------------- SETTLEREACTIONS END ------------------------`
-    );
   }
 
   then(onFulfilled, onRejected) {
@@ -134,6 +120,11 @@ export class MyPromise {
     };
     const nextPromise = new MyPromise(nextPromiseExec);
     const settleNext = (callbackFn, valueOrReason, isRejectionPath) => {
+      if (typeof callbackFn !== "function") {
+        if (isRejectionPath) settleNextRejected(valueOrReason);
+        else settleNextFulfilled(valueOrReason);
+        return;
+      }
       try {
         const result = callbackFn(valueOrReason);
         console.log("settled next result: ${}", result);
